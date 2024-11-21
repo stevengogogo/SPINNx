@@ -349,7 +349,7 @@ axp.plot(points[0], points[1], 'o', label='interior')
 axp.plot(fixed_points[0], fixed_points[1], 'o', label='fixed')
 axp.legend(loc='upper right')
 # %% Plot Bump 
-s = softplus()
+s = gaussian#softplus()
 x = jnp.linspace(-3,3, 100)
 y = jnp.linspace(-3,3, 100)
 X, Y = jnp.meshgrid(x, y)
