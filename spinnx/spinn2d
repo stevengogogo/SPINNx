@@ -1,0 +1,72 @@
+"""
+https://github.com/nn4pde/SPINN/blob/main/code/spinn2d.py
+"""
+import equinox as eqx 
+import jax.numpy as jnp
+import jax
+from typing import Callable
+
+class Shift2D(eqx.Module):
+    x: jnp.ndarray
+    y: jnp.ndarray
+    xf: jnp.ndarray
+    yf: jnp.ndarray
+    h: jnp.ndarray
+
+    def __init__(self, points, fixed_points):
+        dsize = jnp.ptp(points[0])
+        n_free = len(points[0])
+        n_fixed = len(fixed_points[0])
+        n = n_free + n_fixed
+        dx = dsize / jnp.sqrt(n)
+        self.x = points[0] 
+        self.y = points[1]
+        self.xf = fixed_points[0]
+        self.yf = fixed_points[1]
+        self.h = jnp.ones(n) * dx
+
+    @property
+    def xf(self):
+        return jax.lax.stop_gradient(self.xf)
+    
+    @property
+    def yf(self):
+        return jax.lax.stop_gradient(self.yf)
+
+    def get_fixed_points(self):
+        return jnp.concat([self.x, self.xf]), jnp.concat([self.y, self.yf])
+    
+    @eqx.filter_jit
+    def __call__(self, x, y):
+        xc, yc = self.get_centers()
+        fac = 1.0 / self.h 
+        xh = (x - xc) * fac 
+        yh = (y - yc) * fac 
+        return xh, yh
+
+class SPINN2D(eqx.Module):
+    def __init__(self):
+        pass
+
+
+class softplus(eqx.Module):
+    _sp: Callable
+    k: float 
+    fac: float
+    def __init__(self):
+        self._sp = jax.nn.softplus
+        self.k = 1.0 + 4.0 * jnp.log(2.0)
+        self.fac = self._sp(1.0)
+    @property 
+    def k(self):
+        return jax.lax.stop_gradient(self._k)
+    @property
+    def fac(self):
+        return jax.lax.stop_gradient(self._fac)
+    
+    @eqx.filter_jit 
+    def __call__(self, x, y):
+        sp = self._sp 
+        return sp(
+            self.k - sp(2.0*x) - sp(-2.0*x) - sp(2.0*y) - sp(-2.0*y)
+        )/self.fac
