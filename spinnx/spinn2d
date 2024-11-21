@@ -59,15 +59,18 @@ class SPINN2D(eqx.Module):
     def __init__(self, points, fixed_points, activation, key):
         self.layer1 = Shift2D(points, fixed_points)
         n = self.layer1.n 
-        self.layer2 = eqx.nn.Linear(n, 1, key=key)
+        self.layer2 = eqx.nn.Linear(n, 1, use_bias=False, key=key)
         self.activation = activation
     
     @eqx.filter_jit
     def __call__(self, x):
         xh, yh = self.layer1(x[0], x[1])
-        z = self.activation(xh, yh)
+        z = jax.vmap(self.activation)(xh, yh)
         z = self.layer2(z/jnp.sum(z))
         return z
+
+def gaussian(x, y):
+    return jnp.exp(-0.5*(x*x + y*y))
 
 class softplus(eqx.Module):
     _sp: Callable
@@ -222,6 +225,7 @@ def mse(diff_array)->float:
 def linf_norm(diff_array)->float:
     # Infinity norm
     return jnp.max(jnp.abs(diff_array))
+    #return jnp.sqrt(jnp.mean(diff_array**2))
 
 def valid_loss(net, u_true, points):
     up_pred = net(jnp.stack([points[0], points[1]], axis=-1))
@@ -288,14 +292,14 @@ def sample_nodes(n_nodes, xspan, yspan, nb=None):
 
 # %%
 n_nodes = 100
-nb = 40
+nb = 20
 Nc = 400 
 Nbc = 80
 key = jax.random.PRNGKey(0)
 k = jax.random.split(key, 10)
 prob = Poisson2DProblem()
 points, fixed_points = sample_nodes(n_nodes, prob.xspan, prob.yspan, nb=40)
-spinn = SPINN2D(points, fixed_points, softplus(), k[0])
+spinn = SPINN2D(points, fixed_points, gaussian, k[0])
 
 opt = optax.adam(1e-3)
 netopt = train_PINN(spinn, prob, opt, 50000, Nc, Nbc, k[1])
@@ -312,8 +316,16 @@ up_true = jax.vmap(u_true)(X[0], X[1])
 
 print("L infinity norm:", linf_norm(up_true - up_pred))
 
-#%%
+#%% Plot points 
+fig, axs = plt.subplots(2,1)
+for (ax, nt) in zip(axs.ravel(), [spinn, netopt]):
+    ax.plot(nt.layer1.x, nt.layer1.y, 'o', label='interior')
+    ax.plot(nt.layer1.xf, nt.layer1.yf, 'o', label='fixed')
 
+[ax.set_title(name) for (ax, name) in zip(axs.ravel(), ["init", "trained"])]
+
+
+#%% Plot Prediction
 x = jnp.linspace(*prob.xspan, 100)
 y = jnp.linspace(*prob.yspan, 100)
 X, Y = jnp.meshgrid(x, y)
@@ -330,10 +342,20 @@ plt.figure()
 plt.pcolor(X,Y,Z_true - Z)
 plt.colorbar()
 
-#%% Visualization 
+#%% Plot bump locations
 points, fixed_points = sample_nodes(1000, [-3,3], [-3,3])
 figp, axp = plt.subplots()
 axp.plot(points[0], points[1], 'o', label='interior')
 axp.plot(fixed_points[0], fixed_points[1], 'o', label='fixed')
 axp.legend(loc='upper right')
+# %% Plot Bump 
+s = softplus()
+x = jnp.linspace(-3,3, 100)
+y = jnp.linspace(-3,3, 100)
+X, Y = jnp.meshgrid(x, y)
+out = jax.vmap(s)(X.ravel(), Y.ravel()).reshape(X.shape)
+plt.figure()
+plt.pcolor(X, Y, out)
+plt.colorbar()
+
 # %%
