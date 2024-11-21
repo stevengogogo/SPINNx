@@ -1,16 +1,20 @@
 """
 https://github.com/nn4pde/SPINN/blob/main/code/spinn2d.py
 """
+#%%
 import equinox as eqx 
 import jax.numpy as jnp
 import jax
 from typing import Callable
+import optax
+from tqdm import trange, tqdm
+import matplotlib.pyplot as plt
 
 class Shift2D(eqx.Module):
     x: jnp.ndarray
     y: jnp.ndarray
-    xf: jnp.ndarray
-    yf: jnp.ndarray
+    _xf: jnp.ndarray
+    _yf: jnp.ndarray
     h: jnp.ndarray
 
     def __init__(self, points, fixed_points):
@@ -21,19 +25,23 @@ class Shift2D(eqx.Module):
         dx = dsize / jnp.sqrt(n)
         self.x = points[0] 
         self.y = points[1]
-        self.xf = fixed_points[0]
-        self.yf = fixed_points[1]
+        self._xf = fixed_points[0]
+        self._yf = fixed_points[1]
         self.h = jnp.ones(n) * dx
+
+    @property 
+    def n(self):
+        return len(self.h)
 
     @property
     def xf(self):
-        return jax.lax.stop_gradient(self.xf)
+        return jax.lax.stop_gradient(self._xf)
     
     @property
     def yf(self):
-        return jax.lax.stop_gradient(self.yf)
+        return jax.lax.stop_gradient(self._yf)
 
-    def get_fixed_points(self):
+    def get_centers(self):
         return jnp.concat([self.x, self.xf]), jnp.concat([self.y, self.yf])
     
     @eqx.filter_jit
@@ -45,18 +53,30 @@ class Shift2D(eqx.Module):
         return xh, yh
 
 class SPINN2D(eqx.Module):
-    def __init__(self):
-        pass
-
+    layer1: Callable
+    layer2: Callable
+    activation: Callable
+    def __init__(self, points, fixed_points, activation, key):
+        self.layer1 = Shift2D(points, fixed_points)
+        n = self.layer1.n 
+        self.layer2 = eqx.nn.Linear(n, 1, key=key)
+        self.activation = activation
+    
+    @eqx.filter_jit
+    def __call__(self, x):
+        xh, yh = self.layer1(x[0], x[1])
+        z = self.activation(xh, yh)
+        z = self.layer2(z/jnp.sum(z))
+        return z
 
 class softplus(eqx.Module):
     _sp: Callable
-    k: float 
-    fac: float
+    _k: float 
+    _fac: float
     def __init__(self):
         self._sp = jax.nn.softplus
-        self.k = 1.0 + 4.0 * jnp.log(2.0)
-        self.fac = self._sp(1.0)
+        self._k = 1.0 + 4.0 * jnp.log(2.0)
+        self._fac = self._sp(1.0)
     @property 
     def k(self):
         return jax.lax.stop_gradient(self._k)
@@ -70,3 +90,250 @@ class softplus(eqx.Module):
         return sp(
             self.k - sp(2.0*x) - sp(-2.0*x) - sp(2.0*y) - sp(-2.0*y)
         )/self.fac
+    
+
+# Problem 
+u_true = lambda x,y: jnp.sin(2*jnp.pi*x) * jnp.sin(4*jnp.pi*y)
+"""
+class Poisson2D(RegularPDE):
+    def pde(self, x, y, u, ux, uy, uxx, uyy):
+        f = 20*PI**2*torch.sin(2*PI*x)*torch.sin(4*PI*y)
+        return 0.1*(uxx + uyy + f)
+
+    def has_exact(self):
+        return True
+
+    def exact(self, x, y):
+        return np.sin(2*PI*x)*np.sin(4*PI*y)
+
+    def boundary_loss(self, nn):
+        xb, yb = self.boundary()
+        xbn, ybn = (t.detach().cpu().numpy() for t in (xb, yb))
+
+        u = nn(xb, yb)
+        ub = tensor(self.exact(xbn, ybn))
+        bc = u - ub
+        return (bc**2).sum()
+"""
+class Datapoint(eqx.Module):
+    xs: jnp.ndarray
+    ys: jnp.ndarray
+
+class Data(eqx.Module):
+    left_bound: Datapoint
+    right_bound: Datapoint
+    top_bound: Datapoint
+    bottom_bound: Datapoint
+    colloc: Datapoint
+
+class Poisson2DProblem(eqx.Module):
+    xspan: jnp.ndarray # x in [-1,1]
+    yspan: jnp.ndarray # t in [0,1]
+    params: jnp.ndarray # []
+
+    def __init__(self, a=0.1):
+        self.xspan = jnp.array([0.,1.])
+        self.yspan = jnp.array([0.,1.])
+        self.params = jnp.array([a])
+
+    def diffop(self, u_func): # u_func f(x,y) = f(x,t)
+        u_dx = jax.grad(u_func, argnums=0)
+        u_dxx = jax.grad(u_dx, argnums=0)
+        u_dy = jax.grad(u_func, argnums=1)
+        u_dyy = jax.grad(u_dy, argnums=1)
+        f = lambda x,y: 20*jnp.pi**2 * jnp.sin(2*jnp.pi*x) * jnp.sin(4*jnp.pi*y)
+        Lu = lambda x,y, *arg: 0.1 * (u_dxx(x,y, *arg) + u_dyy(x,y, *arg) + f(x,y))
+        return Lu
+
+    def residual_diff(self, u_func, data:Data):
+        Lu = self.diffop(u_func)
+        vLu = jax.vmap(Lu, in_axes=(0,0))
+        Xc = data.colloc 
+        u_colloc_pred = vLu(Xc.xs, Xc.ys)
+        return u_colloc_pred # zero force term
+
+    def init(self, x):
+        return u_true(x, 0.)
+    
+    def boundary_diff(self, u_func, data:Data):
+        u_dx = jax.grad(u_func, argnums=0)
+        vufunc = jax.vmap(u_func, in_axes=(0,0))
+        vu_dx = jax.vmap(u_dx, in_axes=(0,0))
+
+        X_bottom_bound = data.bottom_bound
+        X_left_bound = data.left_bound
+        X_right_bound = data.right_bound 
+
+        # u(0,x) = x^2 cos(pi*x)
+        u_init_pred = vufunc(X_bottom_bound.xs, X_bottom_bound.ys)
+        u_init_true = jax.vmap(self.init)(X_bottom_bound.xs)
+        u_init_diff = u_init_pred - u_init_true
+
+        # u(t,-1) = u(t,1)=0 Drichlet
+        u_left_pred = vufunc(X_left_bound.xs, X_left_bound.ys)
+        u_right_pred = vufunc(X_right_bound.xs, X_right_bound.ys)
+        
+        return jnp.concatenate([u_init_diff, u_left_pred, u_right_pred])
+
+
+class Spatial2DSampler(eqx.Module):
+    xspan: jnp.ndarray
+    yspan: jnp.ndarray
+    Ncl:int
+    Nb:int
+
+    @eqx.filter_jit
+    def sample(self,  key:jax.random.PRNGKey):
+        k = jax.random.split(key, 5)
+        lb = jnp.array([self.xspan[0], self.yspan[0]])
+        ub = jnp.array([self.xspan[1], self.yspan[1]])
+
+        # Sampling
+        xts = jax.random.uniform(k[0], shape=(self.Ncl, 2), minval=lb, maxval=ub)
+        xc = jnp.array(xts[:,0])
+        yc = jnp.array(xts[:,1])
+        yl = jax.random.uniform(k[1], (self.Nb,), minval=self.yspan[0], maxval=self.yspan[1])
+        yr = jax.random.uniform(k[2], (self.Nb,), minval=self.yspan[0], maxval=self.yspan[1])
+        xd = jax.random.uniform(k[3], (self.Nb,), minval=self.xspan[0], maxval=self.xspan[1])
+        xu = jax.random.uniform(k[4], (self.Nb,), minval=self.xspan[0], maxval=self.xspan[1])
+
+        # Datapoint
+        #  ---top---
+        #  |       |
+        #  left    right
+        #  |       |
+        # ---bottom---
+        # ->x 
+        
+        Xc = Datapoint(xc, yc)
+        X_left_bound = Datapoint(jnp.ones_like(yl) * self.xspan[0], yl) 
+        X_right_bound = Datapoint(jnp.ones_like(yr) * self.xspan[1], yr)
+        X_top_bound = Datapoint(xd, jnp.ones_like(xd) * self.yspan[1])
+        X_bottom_bound = Datapoint(xu, jnp.ones_like(xu) * self.yspan[0])
+
+        return Data(X_left_bound, X_right_bound, X_top_bound, X_bottom_bound, Xc)
+    
+# Experiment
+@jax.jit
+def mse(diff_array)->float:
+    return jnp.mean(jnp.square(diff_array))
+
+@jax.jit
+def linf_norm(diff_array)->float:
+    # Infinity norm
+    return jnp.max(jnp.abs(diff_array))
+
+def valid_loss(net, u_true, points):
+    up_pred = net(jnp.stack([points[0], points[1]], axis=-1))
+    up_true = jax.vmap(u_true)(points[0], points[1])
+    return linf_norm(up_true - up_pred)
+
+@eqx.filter_jit
+def loss(model, _data:Data, prob, Lb=1., Lc=1.)->float:
+    u_func = jax.jit(lambda x,y : jnp.sum(model(jnp.stack([x,y], axis=-1))))
+    residual_diff = prob.residual_diff(u_func, _data)
+    boundary_diff = prob.boundary_diff(u_func, _data)
+    return Lb* mse(residual_diff) #+ Lc*mse(boundary_diff)
+
+def train_PINN(model, prob, optim, steps, Ncl:int, Nb:int, key):
+    @eqx.filter_jit
+    def make_step(model, opt_state, data:Data):
+        loss_value, grads = eqx.filter_value_and_grad(loss)(model, data, prob)
+        updates, opt_state = optim.update(grads, opt_state)
+        model = eqx.apply_updates(model, updates)
+        return model, opt_state, loss_value
+    
+    opt_state = optim.init(eqx.filter(model, eqx.is_array))
+    sp = Spatial2DSampler(prob.xspan, prob.yspan, Ncl, Nb)
+    trainloader = jax.jit(lambda key: sp.sample(key))
+
+    # True data
+    x = jnp.linspace(*prob.xspan, 100)
+    y = jnp.linspace(*prob.yspan, 100)
+    X, Y = jnp.meshgrid(x, y)
+    Z_true = jax.vmap(u_true)(X.ravel(), Y.ravel())
+    with tqdm(range(steps)) as t:
+        for step in t:
+            k, key = jax.random.split(key)
+            data = trainloader(k)
+            model, opt_state, loss_tr = make_step(model, opt_state, data)
+            if step % 100 == 0:
+                Z = jax.vmap(model)(jnp.stack([X.ravel(), Y.ravel()], axis=-1))
+                vloss = linf_norm(Z - Z_true)
+                t.set_postfix({'loss': loss_tr, 'valid_loss': vloss})
+    return model
+
+def sample_nodes(n_nodes, xspan, yspan, nb=None):
+    # Interior nodes
+    n = round(jnp.sqrt(n_nodes) + 0.49)
+    dxb2 = 0.5/(n + 1)
+    xl, xr = dxb2, 1.0 - dxb2
+    sl = slice(xl, xr, n*1j)
+    x, y = jnp.mgrid[sl, sl]
+    x = x.ravel() * (xspan[-1] - xspan[0]) + xspan[0]
+    y = y.ravel() * (yspan[-1] - yspan[0]) + yspan[0]
+    points = (x, y)
+
+    # Fixed nodes
+    nb = n if nb is None else nb
+    dxb2 = 0.5/(nb)
+    _x = jnp.linspace(dxb2, 1.0 - dxb2, nb)
+    _o = jnp.ones_like(_x)
+    x = jnp.hstack((_x, _o, _x, 0*_o))
+    y = jnp.hstack((_o*0, _x, _o, _x))
+    x = x.ravel() * (xspan[-1] - xspan[0]) + xspan[0]
+    y = y.ravel() * (yspan[-1] - yspan[0]) + yspan[0]
+    fixed_points = (x, y)
+    return points, fixed_points
+
+# %%
+n_nodes = 100
+nb = 40
+Nc = 400 
+Nbc = 80
+key = jax.random.PRNGKey(0)
+k = jax.random.split(key, 10)
+prob = Poisson2DProblem()
+points, fixed_points = sample_nodes(n_nodes, prob.xspan, prob.yspan, nb=40)
+spinn = SPINN2D(points, fixed_points, softplus(), k[0])
+
+opt = optax.adam(1e-3)
+netopt = train_PINN(spinn, prob, opt, 50000, Nc, Nbc, k[1])
+
+
+#%%
+# Validation 
+points, fixed_points = sample_nodes(1000, prob.xspan, prob.yspan, nb=40)
+#X = jnp.concatenate([jnp.stack([points[0], points[1]], axis=-1), 
+#               jnp.stack([points[0], points[1]], axis=-1)])
+X = jnp.stack([points[0], points[1]], axis=-1)
+up_pred = jax.vmap(netopt)(X)
+up_true = jax.vmap(u_true)(X[0], X[1])
+
+print("L infinity norm:", linf_norm(up_true - up_pred))
+
+#%%
+
+x = jnp.linspace(*prob.xspan, 100)
+y = jnp.linspace(*prob.yspan, 100)
+X, Y = jnp.meshgrid(x, y)
+Z = jax.vmap(netopt)(jnp.stack([X.ravel(), Y.ravel()], axis=-1))
+Z_true = jax.vmap(u_true)(X.ravel(), Y.ravel())
+Z = Z.reshape(X.shape)
+Z_true = Z_true.reshape(X.shape)
+
+plt.figure()
+plt.pcolor(X,Y,Z)
+plt.figure()
+plt.pcolor(X,Y,Z_true)
+plt.figure()
+plt.pcolor(X,Y,Z_true - Z)
+plt.colorbar()
+
+#%% Visualization 
+points, fixed_points = sample_nodes(1000, [-3,3], [-3,3])
+figp, axp = plt.subplots()
+axp.plot(points[0], points[1], 'o', label='interior')
+axp.plot(fixed_points[0], fixed_points[1], 'o', label='fixed')
+axp.legend(loc='upper right')
+# %%
